@@ -1,0 +1,7 @@
+.env
+standard.json
+test/
+logs/
+DockerDesktopWSL/
+sync/data/
+sync/config/

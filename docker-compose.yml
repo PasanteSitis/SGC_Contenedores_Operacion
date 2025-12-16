@@ -1,0 +1,147 @@
+services:
+  db:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  nextcloud:
+    image: nextcloud:latest
+    restart: always
+    ports:
+      - "8080:80"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      NEXTCLOUD_USER: ${POSTGRES_USER}
+      NEXTCLOUD_PASS: ${POSTGRES_PASSWORD}
+      NEXTCLOUD_URL: ${NEXTCLOUD_URL}
+      REDIS_HOST: redis
+    volumes:
+      - nextcloud_data:/var/www/html
+      #- ./sync/data/sync_daemon/repo_work:/var/www/html/data/nextcloud/files
+      - ./logs/nextcloud/apache:/var/log/apache2      
+      
+      #- ./sync/data/sync_daemon/repo_work:/mnt/repo:rw
+    depends_on:
+      - db
+      - redis
+      - collabora
+    healthcheck:
+      test: ["CMD", "curl -fsS --max-time 5 http://localhost:80/status.php || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  audit:
+    build:
+      context: ./audit
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - DATABASE_HOST=db
+      - DATABASE_NAME=${POSTGRES_DB}
+      - DATABASE_USER=${POSTGRES_USER}
+      - DATABASE_PASS=${POSTGRES_PASSWORD}
+      - NEXTCLOUD_LOG_PATH=/var/log/apache2/access.log
+      - NEXTCLOUD_APP_LOG=/var/www/html/data/nextcloud/nextcloud.log
+    volumes:
+      - ./logs/nextcloud/apache:/var/log/apache2:ro
+      - nextcloud_data:/var/www/html:ro
+      - ./audit:/opt/audit:ro
+    depends_on:
+      - db
+      - nextcloud
+
+  collabora:
+    image: collabora/code 
+    environment:
+      domain: nextcloud|localhost|127\.0\.0\.1|app|host\.docker\.internal
+      username: ${COLLABORA_USER}
+      password: ${COLLABORA_PASS}
+      ssl.enable: "false"
+      user_interface.use_integration_theme: "false"
+      NEXTCLOUD_URL: ${NEXTCLOUD_URL}
+    ports:
+      - "9980:9980"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 7 http://localhost:9980/hosting/ || exit 1"]
+      interval: 15s
+      timeout: 7s
+      retries: 10
+
+  sync:
+    build:
+      context: ./sync
+      dockerfile: Dockerfile 
+    working_dir: /nextcloud
+    volumes:
+      - ./sync:/nextcloud:ro
+      - ./sync/data/sync_daemon/repo_work:/data/sync_daemon/repo_work
+      - ./sync/config:/config:ro
+    environment:
+      - GIT_USER=${GIT_USER}
+      - GIT_TOKEN=${GIT_TOKEN}
+      - GIT_REPO=${GIT_REPO}
+      - GIT_CLONE_DIR=/data/sync_daemon/repo_work
+      - NEXTCLOUD_URL=http://nextcloud:80
+      - NEXTCLOUD_USER=${NEXTCLOUD_USER}      
+      - NEXTCLOUD_PASS=${NEXTCLOUD_PASS}
+      - NEXTCLOUD_SYNC_USER=${NEXTCLOUD_SYNC_USER}
+      - NEXTCLOUD_SYNC_PASS=${NEXTCLOUD_SYNC_PASS}
+      - USER_APPPASS_FILE=/config/user_app_passwords.json
+    ports:
+      - "5000:5000"
+    depends_on:
+      - nextcloud
+
+    # servicio one-shot para ejecuciones programadas (batch)
+  sync_batch:
+    build:
+      context: ./sync
+      dockerfile: Dockerfile
+    working_dir: /nextcloud
+    command: ["python", "batch_sync.py"]
+    volumes:
+      - ./sync:/nextcloud:ro
+      - git_repo:/data/sync_daemon/repo_work
+      - ./sync/config:/config:ro
+    environment:
+      - GIT_USER=${GIT_USER}
+      - GIT_TOKEN=${GIT_TOKEN}
+      - GIT_REPO=${GIT_REPO}
+      - GIT_CLONE_DIR=/data/sync_daemon/repo_work
+      - NEXTCLOUD_URL=http://nextcloud:80
+      - NEXTCLOUD_USER=${NEXTCLOUD_USER}
+      - NEXTCLOUD_PASS=${NEXTCLOUD_PASS}
+      - NEXTCLOUD_SYNC_USER=${NEXTCLOUD_SYNC_USER}
+      - NEXTCLOUD_SYNC_PASS=${NEXTCLOUD_SYNC_PASS}
+      - USER_APPPASS_FILE=/config/user_app_passwords.json
+    depends_on:
+      - nextcloud
+
+volumes:
+  db_data:
+  nextcloud_data:
+  git_repo:
+  redis_data:
