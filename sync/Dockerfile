@@ -19,5 +19,3 @@ COPY . /nextcloud
 RUN chmod +x /nextcloud/sync_daemon.py
 
 ENV PYTHONUNBUFFERED=1
-
-ENTRYPOINT ["python", "sync_daemon.py"]

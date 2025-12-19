@@ -10,7 +10,8 @@ import xml.etree.ElementTree as ET
 import requests
 
 # --- Config (heredadas de env) ---
-GIT_CLONE_DIR = os.environ.get("GIT_CLONE_DIR", "/data/sync_daemon/repo_work")
+GIT_CLONE_DIR = os.environ.get("GIT_CLONE_DIR", "/data/sync_daemon/repo_clone")
+GIT_WORK_DIR = os.environ.get("GIT_WORK_DIR", "/data/sync_daemon/repo_work")
 NEXTCLOUD_URL = os.environ.get("NEXTCLOUD_URL", "http://nextcloud:80")
 SYNC_USER = os.environ.get("NEXTCLOUD_SYNC_USER") or os.environ.get("SYNC_USER")
 SYNC_PASS = os.environ.get("NEXTCLOUD_SYNC_PASS") or os.environ.get("SYNC_PASS")
@@ -20,16 +21,40 @@ GIT_REPO = os.environ.get("GIT_REPO")
 DEFAULT_AUTHOR_EMAIL_DOMAIN = os.environ.get("DEFAULT_AUTHOR_EMAIL_DOMAIN", "example.com")
 
 # --- Util helpers ---
+def remove_stale_index_lock(repo_dir):
+    """
+    Si existe .git/index.lock y es viejo, lo elimina.
+    Siempre llamarlo antes de hacer operaciones git automáticas en batch.
+    """
+    lock_path = os.path.join(repo_dir, ".git", "index.lock")
+    try:
+        if os.path.exists(lock_path):
+            age = time.time() - os.path.getmtime(lock_path)
+            # si el lock tiene más de 10 segundos lo consideramos stale y lo eliminamos
+            if age > 10:
+                print(f"Stale git index.lock found (age={age:.1f}s) - removing {lock_path}")
+                os.remove(lock_path)
+            else:
+                print(f"Index.lock exists but is recent (age={age:.1f}s) - proceeding (will retry git ops)")
+    except Exception as e:
+        print("Error while checking/removing index.lock:", e)
+        
 def run(cmd, cwd=None, check=True):
+    # cambio: preferible no usar shell=True para seguridad; dividimos si cmd es list o str
+    import shlex
     print("RUN:", cmd)
-    res = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    if isinstance(cmd, str):
+        args = shlex.split(cmd)
+    else:
+        args = cmd
+    res = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
     if res.stdout:
         print("OUT:", res.stdout.strip())
     if res.returncode != 0:
         if res.stderr:
             print("ERR:", res.stderr.strip())
         if check:
-            raise RuntimeError(f"Command failed: {cmd}\n{res.stderr}")
+            raise RuntimeError(f"Command failed: {' '.join(args)}\n{res.stderr}")
     return res
 
 def _sha256_file(path, block_size=65536):
@@ -39,26 +64,79 @@ def _sha256_file(path, block_size=65536):
             h.update(chunk)
     return h.hexdigest()
 
+def detect_main_branch():
+    candidates = ["main", "master", "trunk"]
+    for b in candidates:
+        res = run(
+            ["git", "--git-dir", GIT_CLONE_DIR, "rev-parse", "--verify", f"refs/heads/{b}"],
+            check=False
+        )
+        if res.returncode == 0:
+            return b
+    raise RuntimeError("No se pudo detectar rama principal (main/master/trunk)")
+
 def ensure_clone():
     remote = os.environ.get("GIT_REMOTE")
     if not remote:
         if not (GIT_USER and GIT_TOKEN and GIT_REPO):
             raise RuntimeError("Faltan GIT_USER/GIT_TOKEN/GIT_REPO")
         remote = f"https://{GIT_USER}:{GIT_TOKEN}@github.com/{GIT_REPO}.git"
-    if not os.path.exists(GIT_CLONE_DIR) or not os.listdir(GIT_CLONE_DIR):
-        print("Clonando repo:", remote)
-        run(f"git clone {remote} {GIT_CLONE_DIR}")
-        run("git lfs install", cwd=GIT_CLONE_DIR, check=False)
-        run('git config user.name "Sync Batch"', cwd=GIT_CLONE_DIR)
-        run(f'git config user.email "sync-batch@{DEFAULT_AUTHOR_EMAIL_DOMAIN}"', cwd=GIT_CLONE_DIR)
+
+    # asegurar work dir
+    os.makedirs(GIT_WORK_DIR, exist_ok=True)
+
+    # --- CLONE DIR ---
+    if os.path.exists(GIT_CLONE_DIR):
+        # ¿ya es un repo git?
+        if os.path.exists(os.path.join(GIT_CLONE_DIR, "HEAD")):
+            print("Repo ya existe en clone dir, haciendo fetch")
+            remove_stale_index_lock(GIT_CLONE_DIR)
+            run(["git", "--git-dir", GIT_CLONE_DIR, "fetch", "--all", "--prune"])
+        else:
+            print("Clone dir existe pero no es repo, limpiando contenido")
+            for entry in os.listdir(GIT_CLONE_DIR):
+                p = os.path.join(GIT_CLONE_DIR, entry)
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p)
+                    else:
+                        os.remove(p)
+                except Exception as e:
+                    print("No se pudo borrar", p, e)
+
+            run(["git", "clone", "--mirror", remote, GIT_CLONE_DIR])
+
     else:
-        try:
-            run("git fetch --all", cwd=GIT_CLONE_DIR, check=False)
-            branch = "main" if run("git rev-parse --verify origin/main", cwd=GIT_CLONE_DIR, check=False).returncode == 0 else "master"
-            run(f"git checkout {branch}", cwd=GIT_CLONE_DIR, check=False)
-            run(f"git pull --rebase origin {branch}", cwd=GIT_CLONE_DIR, check=False)
-        except Exception as e:
-            print("Warning updating repo:", e)
+        print("Clonando repo (mirror):", remote)
+        run(["git", "clone", "--mirror", remote, GIT_CLONE_DIR])
+
+    # --- CHECKOUT A WORKTREE ---
+    branch = detect_main_branch()
+    print("Checkout branch:", branch)
+
+    run([
+        "git",
+        "--git-dir", GIT_CLONE_DIR,
+        "--work-tree", GIT_WORK_DIR,
+        "checkout",
+        "-f",
+        branch
+    ], check=False)
+
+    print("Checkout branch:", branch)
+    run([
+        "git",
+        "--git-dir", GIT_CLONE_DIR,
+        "--work-tree", GIT_WORK_DIR,
+        "checkout",
+        "-f",
+        branch
+    ], check=False)
+
+    run(["git", "--git-dir", GIT_CLONE_DIR, "config", "user.name", "Sync Batch"])
+    run(["git", "--git-dir", GIT_CLONE_DIR, "config", "user.email",
+        f"sync-batch@{DEFAULT_AUTHOR_EMAIL_DOMAIN}"])
+
 
 def safe_repo_relpath(path):
     p = os.path.normpath(path)
@@ -126,14 +204,15 @@ def walk_remote(user, start_dir=""):
 # --- util para detectar contenido idéntico ---
 def find_tracked_file_with_same_content(repo_dir, tmp_path):
     tmp_hash = _sha256_file(tmp_path)
-    res = run("git ls-files", cwd=repo_dir, check=False)
+    # usamos el clone como git-dir y work-tree apuntando al work dir
+    res = run(["git", "--git-dir", GIT_CLONE_DIR, "--work-tree", GIT_WORK_DIR, "ls-files"], cwd=GIT_CLONE_DIR, check=False)
     if res.returncode != 0:
         return None
     for line in res.stdout.splitlines():
         candidate = line.strip()
         if not candidate:
             continue
-        candidate_abs = os.path.join(repo_dir, candidate)
+        candidate_abs = os.path.join(GIT_WORK_DIR, candidate)
         if not os.path.exists(candidate_abs):
             continue
         try:
@@ -152,22 +231,34 @@ def build_commit_message(action, file_path, user=None):
 
 def commit_single_file(repo_rel, owner_username):
     author = f'{owner_username} <{owner_username}@{DEFAULT_AUTHOR_EMAIL_DOMAIN}>'
-    run(f'git add "{repo_rel}"', cwd=GIT_CLONE_DIR)
-    staged = run('git diff --cached --name-only', cwd=GIT_CLONE_DIR, check=False)
+    # ADD usando clone como git-dir y work-tree apuntando al work dir
+    run(["git", "--git-dir", GIT_CLONE_DIR, "--work-tree", GIT_WORK_DIR, "add", repo_rel], cwd=GIT_CLONE_DIR)
+    staged = run(["git", "--git-dir", GIT_CLONE_DIR, "--work-tree", GIT_WORK_DIR, "diff", "--cached", "--name-only"], cwd=GIT_CLONE_DIR, check=False)
     if not staged.stdout.strip():
         print("No changes staged for", repo_rel, "- skipping commit")
         return False
-    action = "actualizar" if run(f'git ls-files --error-unmatch "{repo_rel}"', cwd=GIT_CLONE_DIR, check=False).returncode == 0 else "crear"
+
+    exists = run(["git", "--git-dir", GIT_CLONE_DIR, "--work-tree", GIT_WORK_DIR, "ls-files", "--error-unmatch", repo_rel], cwd=GIT_CLONE_DIR, check=False)
+    action = "actualizar" if exists.returncode == 0 else "crear"
     msg = build_commit_message(action, repo_rel, owner_username)
-    res_commit = run(f'git commit -m "{msg}" --author="{author}"', cwd=GIT_CLONE_DIR, check=False)
+
+    res_commit = run(["git", "--git-dir", GIT_CLONE_DIR, "--work-tree", GIT_WORK_DIR, "commit", "-m", msg, "--author", author], cwd=GIT_CLONE_DIR, check=False)
     if res_commit.returncode != 0:
         print("git commit failed or nothing to commit for", repo_rel)
         return False
-    # push only if commit succeeded
-    branch = "main" if run("git rev-parse --verify origin/main", cwd=GIT_CLONE_DIR, check=False).returncode == 0 else "master"
-    run("git fetch origin", cwd=GIT_CLONE_DIR, check=False)
-    run(f"git rebase origin/{branch}", cwd=GIT_CLONE_DIR, check=False)
-    res_push = run(f"git push origin {branch}", cwd=GIT_CLONE_DIR, check=False)
+
+    # push: primero fetch/rebase y push desde clone
+    branch = detect_main_branch()
+    run([
+        "git",
+        "--git-dir", GIT_CLONE_DIR,
+        "push",
+        "origin",
+        f"HEAD:refs/heads/{branch}"
+    ], check=False)
+    # rebase local branch (work with refs) - command adjusted for mirror/clone layout
+    run(["git", "--git-dir", GIT_CLONE_DIR, "rebase", f"origin/{branch}"], cwd=GIT_CLONE_DIR, check=False)
+    res_push = run(["git", "--git-dir", GIT_CLONE_DIR, "push", "origin", f"HEAD:refs/heads/{branch}"], cwd=GIT_CLONE_DIR, check=False)
     if res_push.returncode != 0:
         print("Push failed for", repo_rel)
         return False
@@ -177,24 +268,82 @@ def main():
     if not SYNC_USER or not SYNC_PASS:
         raise RuntimeError("SYNC_USER/SYNC_PASS faltan")
     ensure_clone()
-    remote_files = walk_remote(SYNC_USER, "")
+    START_DIR = os.environ.get("NEXTCLOUD_START_DIR", "").strip("/")
+
+    remote_files = walk_remote(SYNC_USER, START_DIR)
     print("Remote files discovered:", len(remote_files))
     for remote_path in remote_files:
         tmp = None
+
+        # ---- filtros ANTES de cualquier normalización ----
+        if remote_path.startswith(".git") or "/.git/" in remote_path:
+            print("Skipping .git path:", remote_path)
+            continue
+
+        skip_prefixes = (
+            ".ocdata",
+            "appdata_",
+            "preview",
+            "thumbnails",
+            ".cache",
+            "files_trashbin"
+        )
+        low = remote_path.lower()
+        if any(low.startswith(pref) or f"/{pref}/" in f"/{low}" for pref in skip_prefixes):
+            print("Skipping internal/preview file:", remote_path)
+            continue
+
+        # normalizar y mapear la ruta remota a la ruta relativa del repo
         try:
             repo_relpath = safe_repo_relpath(remote_path)
         except Exception as e:
             print("Skipping unsafe path:", remote_path, e)
             continue
+
+        # Si se definió NEXTCLOUD_START_DIR (p.ej. "Sistema_de_Gestion_de_Calidad"),
+        # queremos quitar ese prefijo para que los archivos del groupfolder vayan
+        # al root del repo (o a su estructura interna), en lugar de crear una
+        # carpeta extra "Sistema_de_Gestion_de_Calidad" en el repo.
+        START_DIR = os.environ.get("NEXTCLOUD_START_DIR", "").strip("/")
+        if START_DIR:
+            # si repo_relpath = "Sistema_de_Gestion_de_Calidad/01_Gestion_Humana/archivo"
+            # lo convertimos a "01_Gestion_Humana/archivo"
+            if repo_relpath == START_DIR:
+                # el path apunta exactamente a la carpeta de inicio; en este caso
+                # no hay archivo a procesar (es un folder), lo saltamos
+                print("Skipping top-level start dir entry:", repo_relpath)
+                continue
+            if repo_relpath.startswith(START_DIR + "/"):
+                repo_relpath = repo_relpath[len(START_DIR)+1:]
+
+        # Opción adicional: si dentro del groupfolder subiste un topdir con el nombre
+        # del repo (p.ej. "Sistema_de_Gestion_de_Calidad/Sistema_de_Gestion_de_Calidad/..."),
+        # puedes quitar también ese topdir (controlado por env var STRIP_REPO_TOPDIR).
+        STRIP_REPO_TOPDIR = os.environ.get("STRIP_REPO_TOPDIR", "1")  # "1" por defecto
+        repo_basename = os.path.basename(GIT_REPO).split(".")[0] if GIT_REPO else None
+        if STRIP_REPO_TOPDIR in ("1","true","True") and repo_basename:
+            if repo_relpath.startswith(repo_basename + "/"):
+                repo_relpath = repo_relpath[len(repo_basename)+1:]
+
+        # Finalmente, si la ruta resultante es vacía (ej. se refería solo al topdir),
+        # saltamos (no procesamos carpetas sin nombre de archivo)
+        if not repo_relpath or repo_relpath.strip("/") == "":
+            print("Resulting repo_relpath empty after strip - skipping:", remote_path)
+            continue
+
+        # ahora repo_relpath representa la ruta relativa que queremos en el repo
+        dest_rel = repo_relpath
+
         tmp, status, body = dav_download(SYNC_USER, remote_path)
         if not tmp:
             print("Download failed for", remote_path, status, body)
             continue
+
         try:
             matched = find_tracked_file_with_same_content(GIT_CLONE_DIR, tmp)
-            dest_rel = repo_relpath
-            dest_abs = os.path.join(GIT_CLONE_DIR, dest_rel)
+            dest_abs = os.path.join(GIT_WORK_DIR, dest_rel)
             os.makedirs(os.path.dirname(dest_abs), exist_ok=True)
+
             if matched and matched != dest_rel:
                 print("Detected rename by content:", matched, "->", dest_rel)
                 try:
@@ -202,33 +351,28 @@ def main():
                 except Exception:
                     shutil.copy2(tmp, dest_abs)
                     os.remove(tmp)
+
                 run(f'git mv "{matched}" "{dest_rel}"', cwd=GIT_CLONE_DIR, check=False)
-                committed = commit_single_file(dest_rel, SYNC_USER)
-                if committed:
-                    print("Committed rename:", dest_rel)
+                commit_single_file(dest_rel, SYNC_USER)
+
             else:
-                # if matched == dest_rel -> content identical with tracked file at same path => skip
                 if matched == dest_rel:
-                    print("No content change for", dest_rel, "- skipping")
+                    print("No content change for", dest_rel)
                     os.remove(tmp)
                     continue
-                # replace/create
+
                 try:
                     shutil.move(tmp, dest_abs)
                 except Exception:
                     shutil.copy2(tmp, dest_abs)
                     os.remove(tmp)
-                committed = commit_single_file(dest_rel, SYNC_USER)
-                if committed:
-                    print("Committed file:", dest_rel)
+
+                commit_single_file(dest_rel, SYNC_USER)
+
         except Exception as e:
             print("Error processing", remote_path, e)
-            try:
-                if tmp and os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            continue
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
 
 if __name__ == "__main__":
     main()

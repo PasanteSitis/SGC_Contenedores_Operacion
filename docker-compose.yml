@@ -38,10 +38,8 @@ services:
       REDIS_HOST: redis
     volumes:
       - nextcloud_data:/var/www/html
-      #- ./sync/data/sync_daemon/repo_work:/var/www/html/data/nextcloud/files
-      - ./logs/nextcloud/apache:/var/log/apache2      
-      
-      #- ./sync/data/sync_daemon/repo_work:/mnt/repo:rw
+      - git_work:/var/www/html/data/__groupfolders/1/files:rw
+      - ./logs/nextcloud/apache:/var/log/apache2
     depends_on:
       - db
       - redis
@@ -90,58 +88,39 @@ services:
       timeout: 7s
       retries: 10
 
-  sync:
-    build:
-      context: ./sync
-      dockerfile: Dockerfile 
-    working_dir: /nextcloud
-    volumes:
-      - ./sync:/nextcloud:ro
-      - ./sync/data/sync_daemon/repo_work:/data/sync_daemon/repo_work
-      - ./sync/config:/config:ro
-    environment:
-      - GIT_USER=${GIT_USER}
-      - GIT_TOKEN=${GIT_TOKEN}
-      - GIT_REPO=${GIT_REPO}
-      - GIT_CLONE_DIR=/data/sync_daemon/repo_work
-      - NEXTCLOUD_URL=http://nextcloud:80
-      - NEXTCLOUD_USER=${NEXTCLOUD_USER}      
-      - NEXTCLOUD_PASS=${NEXTCLOUD_PASS}
-      - NEXTCLOUD_SYNC_USER=${NEXTCLOUD_SYNC_USER}
-      - NEXTCLOUD_SYNC_PASS=${NEXTCLOUD_SYNC_PASS}
-      - USER_APPPASS_FILE=/config/user_app_passwords.json
-    ports:
-      - "5000:5000"
-    depends_on:
-      - nextcloud
-
-    # servicio one-shot para ejecuciones programadas (batch)
+  # servicio one-shot para ejecuciones programadas (batch)
   sync_batch:
     build:
       context: ./sync
       dockerfile: Dockerfile
     working_dir: /nextcloud
-    command: ["python", "batch_sync.py"]
+    command: ["python", "/nextcloud/sync_daemon.py"]
     volumes:
+      - git_clone:/data/sync_daemon/repo_clone
+      - git_work:/data/sync_daemon/repo_work
       - ./sync:/nextcloud:ro
-      - git_repo:/data/sync_daemon/repo_work
       - ./sync/config:/config:ro
     environment:
       - GIT_USER=${GIT_USER}
       - GIT_TOKEN=${GIT_TOKEN}
       - GIT_REPO=${GIT_REPO}
-      - GIT_CLONE_DIR=/data/sync_daemon/repo_work
+      - GIT_CLONE_DIR=/data/sync_daemon/repo_clone
+      - GIT_WORK_DIR=/data/sync_daemon/repo_work
       - NEXTCLOUD_URL=http://nextcloud:80
       - NEXTCLOUD_USER=${NEXTCLOUD_USER}
       - NEXTCLOUD_PASS=${NEXTCLOUD_PASS}
       - NEXTCLOUD_SYNC_USER=${NEXTCLOUD_SYNC_USER}
       - NEXTCLOUD_SYNC_PASS=${NEXTCLOUD_SYNC_PASS}
       - USER_APPPASS_FILE=/config/user_app_passwords.json
+      - NEXTCLOUD_GROUPFOLDER_ID=1
+      - NEXTCLOUD_START_DIR=Sistema_de_Gestion_de_Calidad
+      - STRIP_REPO_TOPDIR=1
     depends_on:
       - nextcloud
 
 volumes:
   db_data:
   nextcloud_data:
-  git_repo:
+  git_clone:
+  git_work:
   redis_data:
