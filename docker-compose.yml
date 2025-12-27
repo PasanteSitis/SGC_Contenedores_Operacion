@@ -50,26 +50,6 @@ services:
       timeout: 5s
       retries: 10
 
-  audit:
-    build:
-      context: ./audit
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    environment:
-      - DATABASE_HOST=db
-      - DATABASE_NAME=${POSTGRES_DB}
-      - DATABASE_USER=${POSTGRES_USER}
-      - DATABASE_PASS=${POSTGRES_PASSWORD}
-      - NEXTCLOUD_LOG_PATH=/var/log/apache2/access.log
-      - NEXTCLOUD_APP_LOG=/var/www/html/data/nextcloud/nextcloud.log
-    volumes:
-      - ./logs/nextcloud/apache:/var/log/apache2:ro
-      - nextcloud_data:/var/www/html:ro
-      - ./audit:/opt/audit:ro
-    depends_on:
-      - db
-      - nextcloud
-
   collabora:
     image: collabora/code 
     environment:
@@ -88,35 +68,42 @@ services:
       timeout: 7s
       retries: 10
 
-  # servicio one-shot para ejecuciones programadas (batch)
   sync_batch:
     build:
       context: ./sync
       dockerfile: Dockerfile
-    working_dir: /nextcloud
-    command: ["python", "/nextcloud/sync_daemon.py"]
+    image: nextcloud_sync:local
+    container_name: nextcloud_git_sync
+    restart: unless-stopped
+    user: "33:33"
     volumes:
-      - git_clone:/data/sync_daemon/repo_clone
-      - git_work:/data/sync_daemon/repo_work
-      - ./sync:/nextcloud:ro
-      - ./sync/config:/config:ro
+      - git_work:/repo:rw                 
+      - ./sync:/sync:ro   
+    env_file:
+      - .env
     environment:
       - GIT_USER=${GIT_USER}
       - GIT_TOKEN=${GIT_TOKEN}
       - GIT_REPO=${GIT_REPO}
-      - GIT_CLONE_DIR=/data/sync_daemon/repo_clone
-      - GIT_WORK_DIR=/data/sync_daemon/repo_work
-      - NEXTCLOUD_URL=http://nextcloud:80
-      - NEXTCLOUD_USER=${NEXTCLOUD_USER}
-      - NEXTCLOUD_PASS=${NEXTCLOUD_PASS}
-      - NEXTCLOUD_SYNC_USER=${NEXTCLOUD_SYNC_USER}
-      - NEXTCLOUD_SYNC_PASS=${NEXTCLOUD_SYNC_PASS}
-      - USER_APPPASS_FILE=/config/user_app_passwords.json
-      - NEXTCLOUD_GROUPFOLDER_ID=1
-      - NEXTCLOUD_START_DIR=Sistema_de_Gestion_de_Calidad
-      - STRIP_REPO_TOPDIR=1
+      - GIT_BRANCH=${GIT_BRANCH:-master}
+      - REPO_DIR=/repo
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-300}
+      - NEXTCLOUD_URL=${NEXTCLOUD_URL}
+      - NEXTCLOUD_API_USER=${NEXTCLOUD_API_USER}
+      - NEXTCLOUD_API_PASS=${NEXTCLOUD_API_PASS}
+      - NEXTCLOUD_START_DIR=${NEXTCLOUD_START_DIR}
+      - EDITOR_CACHE_TTL=${EDITOR_CACHE_TTL:-600}
+      - EMAIL_DOMAIN=${EMAIL_DOMAIN:-sitis.com.com}
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASS=${POSTGRES_PASSWORD}
+    entrypoint: ["sh","-c"]
+    command: ["/sync/sync_daemon.sh"]
     depends_on:
       - nextcloud
+      - db
 
 volumes:
   db_data:

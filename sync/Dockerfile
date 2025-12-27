@@ -1,6 +1,6 @@
 FROM alpine/git:latest
 
-RUN apk add --no-cache python3 py3-pip curl ca-certificates && \
+RUN apk add --no-cache python3 py3-pip curl ca-certificates postgresql-client jq && \
     ln -sf /usr/bin/python3 /usr/bin/python
 
 # copiar solo scripts para el servicio (sync/ está montado ro, pero para build copy helps)
