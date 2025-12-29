@@ -40,6 +40,7 @@ services:
       - nextcloud_data:/var/www/html
       - git_work:/var/www/html/data/__groupfolders/1/files:rw
       - ./logs/nextcloud/apache:/var/log/apache2
+      - ./apache/logging.conf:/etc/apache2/conf-available/logging.conf:ro
     depends_on:
       - db
       - redis
@@ -104,6 +105,30 @@ services:
     depends_on:
       - nextcloud
       - db
+
+  audit:
+    build:
+      context: ./audit
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_HOST=db
+      - NEXTCLOUD_LOG_PATH=/var/log/apache2/access.log
+      - NEXTCLOUD_APP_LOG=/var/www/html/data/nextcloud/nextcloud.log
+      - DOCKER_SOCK=0           # poner 1 si quieres habilitar docker logs fallback (leer abajo)
+      - NEXTCLOUD_CONTAINER=nextcloud
+      - DEDUPE_SECONDS=2
+      - CORRELATION_WINDOW=30
+    volumes:
+      - ./logs/nextcloud/apache:/var/log/apache2:ro    # preferible: apache writes here
+      - nextcloud_data:/var/www/html:ro               # read-only to access nextcloud.log
+      - ./audit:/opt/audit:ro
+    depends_on:
+      - db
+      - nextcloud
 
 volumes:
   db_data:

@@ -1,0 +1,4 @@
+psycopg2-binary
+watchdog
+python-dateutil
+docker
