@@ -130,6 +130,35 @@ services:
       - db
       - nextcloud
 
+  sidecar:
+    build:
+      context: ./sidecar
+      dockerfile: Dockerfile
+    image: nextcloud_sidecar:local
+    container_name: nextcloud_sidecar
+    restart: unless-stopped
+    user: "33:33" 
+    environment:
+      - ROOT_DIR=/repo
+      - RUN_INTERVAL=1500        # segundos
+      - GIT_COMMIT=0            # 0 = no hace commit (sync_batch lo hará); 1 = hace commit
+      - GIT_USER=sidecar-bot
+      - GIT_EMAIL=sidecar@local
+      - GIT_BRANCH=master
+    volumes:
+      - git_work:/repo:rw                # mount same place where sync_batch uses repo
+      - nextcloud_data:/var/www/html:ro  # lectura si necesitas (opcional)
+      - ./sidecar:/opt/sidecar:ro        # copia de scripts (lectura)
+    depends_on:
+      - db
+      - nextcloud
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
 volumes:
   db_data:
   nextcloud_data:

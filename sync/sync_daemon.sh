@@ -1,5 +1,6 @@
 #!/bin/sh
 # sync_daemon.sh - DB-only, prioriza fileid -> oc_activity para detectar autor humano
+# Versión: batching de commits para metadata.yml (un solo commit para todos los sidecars modificados)
 set -eu
 
 REPO_DIR="${REPO_DIR:-/repo}"
@@ -8,10 +9,13 @@ GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Nextcloud Sync}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync@localhost}"
 SYNC_INTERVAL="${SYNC_INTERVAL:-300}"
 
+# Nombre del archivo sidecar que queremos agrupar
+METADATA_FILENAME="metadata.yml"
+
 # Lista de cuentas consideradas "sistema" (no humanas)
 SYSTEM_USERS="nextcloud system cron updater www-data"
 
-# log -> STDERR (importante: evitar contaminar stdout de funciones que retornan valores)
+# log -> STDERR
 log() { printf '%s - %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')" "$*" >&2; }
 
 log "DEBUG: REPO_DIR=${REPO_DIR}"
@@ -85,11 +89,11 @@ lookup_user_meta() {
     [ -n "$acc_err" ] && log "DEBUG: psql oc_accounts stderr: $acc_err"
     if [ -n "$acc_out" ]; then
       if [ -z "$display" ]; then
-        d=$(printf '%s' "$acc_out" | sed -n 's/.*"displayname"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+        d=$(printf '%s' "$acc_out" | sed -n 's/.*"displayname"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' || true)
         [ -n "$d" ] && display="$d"
       fi
       if [ -z "$email" ]; then
-        m=$(printf '%s' "$acc_out" | sed -n 's/.*"email"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' || true)
+        m=$(printf '%s' "$acc_out" | sed -n 's/.*"email"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' || true)
         [ -n "$m" ] && email="$m"
       fi
     fi
@@ -100,8 +104,6 @@ lookup_user_meta() {
 # ---------------- end lookup_user_meta ----------------
 
 # ---------------- helper: find_author_for_path ----------------
-# Entrada: ruta completa nc_path (p.e. /TopDir/dir/file.docx)
-# Salida: imprime "username" en stdout (solo el nombre)
 find_author_for_path() {
   nc_path="$1"
   nc_rel=$(printf '%s' "$nc_path" | sed 's%^/%%' )
@@ -111,7 +113,6 @@ find_author_for_path() {
     return 0
   fi
 
-  # intentar fileid en oc_filecache
   SQL_FILEID="SELECT fileid FROM oc_filecache WHERE path='${nc_rel}' LIMIT 1;"
   fcid=$(PGPASSWORD="${DB_PASS:-}" psql -h "${DB_HOST:-}" -p "${DB_PORT:-5432}" -U "${DB_USER:-}" -d "${DB_NAME:-}" -t -A -F '|' -c "${SQL_FILEID}" 2>/tmp/psql_fcid_err || true)
   fcid_err=$(cat /tmp/psql_fcid_err 2>/dev/null || true)
@@ -125,21 +126,17 @@ find_author_for_path() {
     [ -n "$acts_err" ] && log "DEBUG: psql oc_activity(act list) stderr: $acts_err"
     log "DEBUG: oc_activity rows for fileid=${fcid}: [$acts_out]"
 
-    # buscar primera fila cuyo username NO sea SYSTEM_USERS
     if [ -n "$acts_out" ]; then
-      # lista de usernames (col1)
       human=$(printf '%s' "$acts_out" | cut -d'|' -f1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v -E "^(?:$(echo "$SYSTEM_USERS" | sed 's/ /|/g'))$" | head -n1 || true)
       if [ -n "$human" ]; then
         printf '%s' "$human"
         return 0
       fi
-      # si no hay humano, devolver la primera username (más reciente aunque sea sistema)
       first_user=$(printf '%s' "$acts_out" | cut -d'|' -f1 | head -n1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
       [ -n "$first_user" ] && printf '%s' "$first_user" && return 0
     fi
   fi
 
-  # fallback por texto en subjectparams/file
   esc_path=$(printf '%s' "$nc_path" | sed "s/'/''/g")
   like_plain="%${esc_path}%"
   SQL_FALL="SELECT COALESCE(\"user\", affecteduser) AS username, object_id, file, subjectparams, timestamp
@@ -158,18 +155,15 @@ LIMIT 5;"
   log "DEBUG: fallback oc_activity result raw: [$fall_out] for nc_path=$nc_path"
 
   if [ -n "$fall_out" ]; then
-    # preferir no-sistema:
     human2=$(printf '%s' "$fall_out" | cut -d'|' -f1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v -E "^(?:$(echo "$SYSTEM_USERS" | sed 's/ /|/g'))$" | head -n1 || true)
     if [ -n "$human2" ]; then
       printf '%s' "$human2"
       return 0
     fi
-    # si no hay humano, devolver la primera
     uname=$(printf '%s' "$fall_out" | cut -d'|' -f1 | head -n1 | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
     [ -n "$uname" ] && printf '%s' "$uname" && return 0
   fi
 
-  # nada encontrado
   printf ''
 }
 # ---------------- end find_author_for_path ----------------
@@ -178,7 +172,11 @@ process_once() {
   log "Starting single sync run..."
   git fetch origin || log "Warning: git fetch failed"
 
-  git status --porcelain -z --untracked-files=all | while IFS= read -r -d '' entry; do
+  TMP_META=$(mktemp)
+  trap 'rm -f "$TMP_META"' EXIT
+
+  # Use process-substitution to avoid subshell losing variables? we write meta entries to TMP_META
+  while IFS= read -r -d '' entry; do
     code=$(printf "%s" "$entry" | cut -c1-2)
     path=$(printf "%s" "$entry" | cut -c4-)
     [ -z "$path" ] && path="$entry"
@@ -217,6 +215,14 @@ process_once() {
       log "Warning: git add falló para $path"
     fi
 
+    # if this is a metadata sidecar, queue it for a single batch commit
+    if [ "$(basename "$path")" = "$METADATA_FILENAME" ]; then
+      # store path and resolved username
+      printf '%s|%s\n' "$path" "$editor_user" >> "$TMP_META"
+      # don't commit here
+      continue
+    fi
+
     if [ "$code" = "??" ]; then
       msg="Add: $path"
     elif [ "$wk_char" = "D" ] || [ "$idx_char" = "D" ]; then
@@ -232,7 +238,45 @@ process_once() {
       log "Commit failed for $path"
     fi
 
-  done
+  done < <(git status --porcelain -z --untracked-files=all)
+
+  # After loop: handle batch commit for metadata files
+  if [ -s "$TMP_META" ]; then
+    count=$(wc -l < "$TMP_META" | tr -d '[:space:]')
+    # pick preferred author: prefer most frequent non-system user, else most frequent overall, else fallback
+    SYS_RE=$(echo "$SYSTEM_USERS" | sed 's/ /|/g')
+    preferred=$(awk -F'|' '{if($2!="") print $2}' "$TMP_META" | sort | uniq -c | sort -rn | awk '{print $2}' | while read u; do
+      if [ -z "$u" ]; then
+        continue
+      fi
+      if ! echo "$SYSTEM_USERS" | grep -E "(^| )$u( |$)" >/dev/null 2>&1; then
+        printf '%s' "$u"; exit 0
+      fi
+    done || true)
+    if [ -z "$preferred" ]; then
+      preferred=$(awk -F'|' '{if($2!="") print $2; else print ""}' "$TMP_META" | sort | uniq -c | sort -rn | awk '{print $2}' | head -n1 || true)
+    fi
+    if [ -z "$preferred" ]; then
+      preferred_user_display="$GIT_AUTHOR_NAME"
+      preferred_user_email="$GIT_AUTHOR_EMAIL"
+    else
+      meta=$(lookup_user_meta "$preferred" 2>/dev/null || true)
+      preferred_user_display=$(printf '%s' "$meta" | cut -d'|' -f1)
+      preferred_user_email=$(printf '%s' "$meta" | cut -d'|' -f2)
+      [ -z "$preferred_user_display" ] && preferred_user_display="$preferred"
+      [ -z "$preferred_user_email" ] && preferred_user_email="${preferred}@${EMAIL_DOMAIN:-example.com}"
+    fi
+
+    # build commit message and path list
+    files_list=$(cut -d'|' -f1 "$TMP_META" | tr '\n' ' ')
+    msg="Update sidecars (${count} files): $(cut -d'|' -f1 "$TMP_META" | head -n5 | tr '\n' ',' )"
+
+    if git -c "user.name=$preferred_user_display" -c "user.email=$preferred_user_email" commit -m "$msg" -- $files_list; then
+      log "Committed batch metadata ($count files) as $preferred_user_display <$preferred_user_email>"
+    else
+      log "Batch commit for metadata failed"
+    fi
+  fi
 
   ahead=$(git rev-list --count origin/"$GIT_BRANCH"..HEAD 2>/dev/null || echo 0)
   if [ "${ahead:-0}" -gt 0 ]; then
