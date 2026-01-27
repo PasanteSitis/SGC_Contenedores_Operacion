@@ -38,6 +38,37 @@ CONTROLLED_TYPES = {
 def log(*a):
     print(datetime.utcnow().isoformat() + "Z -", *a, flush=True)
 
+def load_existing_yaml(path):
+    """Devuelve lista/dict del YAML existente o None si no existe / no se puede leer."""
+    try:
+        if not os.path.exists(path):
+            return None
+        if HAVE_YAML:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = yaml.safe_load(f)
+                return existing
+        else:
+            # fallback: leer como texto (no ideal); devolver None para forzar reescritura
+            return None
+    except Exception:
+        return None
+    
+def normalize_entries_for_compare(entries):
+    """Normaliza para comparar: orden estable por 'nombre' y reemplaza None->''."""
+    if entries is None:
+        return None
+    if isinstance(entries, dict):
+        return entries
+    # lista de dicts -> ordenada por nombre
+    def keyfn(x):
+        return (x.get("nombre","") or "").lower()
+    out = []
+    for e in sorted(entries, key=keyfn):
+        # normalizar tipos y None
+        ne = {k: ("" if v is None else v) for k,v in e.items()}
+        out.append(ne)
+    return out
+
 def normalize_token(s):
     if s is None: return ""
     s = str(s).replace("_", " ").strip()
@@ -345,9 +376,31 @@ def build_sidecars(root):
             entries.append(entry)
         outpath = os.path.join(dirpath, METADATA_FILENAME)
         try:
-            write_yaml_atomic(outpath, entries)
-            total_dirs += 1
-            log("Creado/actualizado:", outpath, f"({len(entries)} archivos)")
+            # cargar contenido previo para comparar
+            existing = load_existing_yaml(outpath)
+            new_norm = normalize_entries_for_compare(entries)
+            existing_norm = normalize_entries_for_compare(existing)
+
+            if existing_norm is not None and existing_norm == new_norm:
+                # no hay cambios reales -> no escribir
+                log("Sin cambios en:", outpath)
+            else:
+                # antes de escribir, asegurémonos que 'ultima_revision' no sea cambiada innecesariamente:
+                # si existe una entrada previa para el mismo 'nombre' con la misma 'id', preservamos ultima_revision si coincide.
+                if existing and isinstance(existing, list):
+                    prev_map = { e.get("nombre",""): e for e in existing if isinstance(e, dict) }
+                    for e in entries:
+                        pname = e.get("nombre","")
+                        prev = prev_map.get(pname)
+                        if prev:
+                            # si id coincide y ultima_revision calculada es igual a previa, mantén la previa
+                            if e.get("id") and prev.get("id") and e.get("id") == prev.get("id"):
+                                if (e.get("ultima_revision") or "") == (prev.get("ultima_revision") or ""):
+                                    e["ultima_revision"] = prev.get("ultima_revision","")
+                # escritura atómica
+                write_yaml_atomic(outpath, entries)
+                total_dirs += 1
+                log("Creado/actualizado:", outpath, f"({len(entries)} archivos)")
         except Exception as e:
             log("Error escribiendo", outpath, ":", e)
     log("Finished. directorios procesados:", total_dirs, "archivos inspeccionados:", total_files)

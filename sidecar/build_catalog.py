@@ -8,6 +8,7 @@ Genera/actualiza catalogo_grouped.xlsx y catalog_index.json a partir de metadata
 from __future__ import annotations
 import os, sys, json, yaml, re, unicodedata, tempfile
 from datetime import datetime, timezone
+from hashlib import sha1
 try:
     import pandas as pd
     from openpyxl import Workbook
@@ -26,6 +27,13 @@ DEFAULT_BASE_COLS = [
 
 def log(*a):
     print(datetime.now(timezone.utc).isoformat(), "-", *a, flush=True)
+
+def file_sha1(path):
+    h = sha1()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 def normalize_header(h):
     if h is None: return ""
@@ -294,8 +302,34 @@ def write_grouped_excel_atomic(path, index, rows, column_order, df_old=None):
         ws.column_dimensions[get_column_letter(i)].width = min(maxlen + 2, 60)
     tmp = path + ".tmp"
     wb.save(tmp)
-    os.replace(tmp, path)
-    log("Catálogo guardado:", path)
+    # si no existe el path actual -> moverlo
+    if not os.path.exists(path):
+        os.replace(tmp, path)
+        log("Catálogo guardado (nuevo):", path)
+        return True
+    # comparar hashes
+    try:
+        existing_hash = file_sha1(path)
+        tmp_hash = file_sha1(tmp)
+        if existing_hash == tmp_hash:
+            os.remove(tmp)
+            log("Catálogo sin cambios; no se sobrescribe:", path)
+            return False
+        else:
+            os.replace(tmp, path)
+            log("Catálogo guardado (modificado):", path)
+            return True
+    except Exception as e:
+        # error al comparar -> reemplazar por seguridad
+        try:
+            os.replace(tmp, path)
+            log("Catálogo guardado (fallback):", path, "error-compare:", e)
+            return True
+        except Exception as ee:
+            log("Error guardando catálogo:", ee)
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            return False
 
 def main():
     if len(sys.argv) < 2:
@@ -336,14 +370,26 @@ def main():
     else:
         column_order = DEFAULT_BASE_COLS.copy()
         log("Usando columnas por defecto:", column_order)
-    index = build_index_from_new_rows(index, rows, df_old=df_old)
+    index_new = build_index_from_new_rows(index, rows, df_old=df_old)
+    
+    index_old = read_existing_index(index_path)
+    if index_old != index_new:
+        save_index_atomic(index_new, index_path)
+        log("Index updated:", index_path)
+    else:
+        log("Index unchanged; no se sobrescribe:", index_path)
+    
+    index = index_new
+    
     save_index_atomic(index, index_path)
     df_new = pd.DataFrame(rows) if rows else pd.DataFrame(columns=DEFAULT_BASE_COLS)
     df_final = merge_extra_columns(df_new, df_old)
     for c in column_order:
         if c not in df_final.columns:
             df_final[c] = None
-    write_grouped_excel_atomic(catalog_path, index, rows, column_order, df_old=df_old)
+    changed = write_grouped_excel_atomic(catalog_path, index, rows, column_order, df_old=df_old)
+    if not changed:
+        log("No se modificó catalogo_grouped.xlsx")
     log("Listo.")
 
 if __name__ == "__main__":

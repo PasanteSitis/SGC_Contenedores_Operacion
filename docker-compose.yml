@@ -118,7 +118,7 @@ services:
       - DB_HOST=db
       - NEXTCLOUD_LOG_PATH=/var/log/apache2/access.log
       - NEXTCLOUD_APP_LOG=/var/www/html/data/nextcloud/nextcloud.log
-      - DOCKER_SOCK=0           # poner 1 si quieres habilitar docker logs fallback (leer abajo)
+      - DOCKER_SOCK=0           # poner 1 para habilitar docker logs fallback
       - NEXTCLOUD_CONTAINER=nextcloud
       - DEDUPE_SECONDS=2
       - CORRELATION_WINDOW=30
